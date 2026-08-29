@@ -243,6 +243,25 @@ foreach ( $invalid_sources as $label => $json ) {
 	lunara_test_remove_tree( $root );
 }
 
+// The bounded root-level legacy candidate is supported when the primary path is absent.
+lunara_test_reset();
+$root = sys_get_temp_dir() . '/lunara-imdb-guard-' . bin2hex( random_bytes( 6 ) );
+mkdir( $root, 0777, true );
+file_put_contents( $root . '/imdb-title-map.json', '{"Root Fallback|1988":"tt1234567"}' );
+$GLOBALS['lunara_test_stylesheet_directory'] = $root;
+lunara_test_assert_same( true, $guard->maybe_migrate_title_map(), 'The active stylesheet root fallback should migrate when the primary candidate is absent.' );
+lunara_test_assert_same( array( 'root fallback|1988' => 'tt1234567' ), lunara_imdb_guard_get_title_map(), 'Root fallback migration must use the same canonical normalization.' );
+lunara_test_remove_tree( $root );
+
+// Two present legacy candidates must agree exactly; conflicting sources stay retryable.
+lunara_test_reset();
+$root = lunara_test_write_legacy( '{"Primary|1999":"tt1234567"}' );
+file_put_contents( $root . '/imdb-title-map.json', '{"Conflicting|2000":"tt7654321"}' );
+lunara_test_assert_same( false, $guard->maybe_migrate_title_map(), 'Conflicting bounded legacy candidates must not choose one source silently.' );
+lunara_test_assert( ! array_key_exists( Lunara_IMDb_Guard::OPTION_TITLE_MAP, $GLOBALS['lunara_test_options'] ), 'Conflicting candidates must not create canonical storage.' );
+lunara_test_assert( ! array_key_exists( Lunara_IMDb_Guard::OPTION_TITLE_MAP_MIGRATION, $GLOBALS['lunara_test_options'] ), 'Conflicting candidates must remain retryable.' );
+lunara_test_remove_tree( $root );
+
 lunara_test_reset();
 $GLOBALS['lunara_test_stylesheet_directory'] = sys_get_temp_dir() . '/lunara-imdb-guard-no-source-' . bin2hex( random_bytes( 4 ) );
 lunara_test_assert_same( false, $guard->maybe_migrate_title_map(), 'A missing legacy source must remain retryable.' );

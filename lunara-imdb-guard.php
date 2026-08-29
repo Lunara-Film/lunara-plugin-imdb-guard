@@ -22,16 +22,16 @@ define( 'LUNARA_IMDB_GUARD_DEFAULT_OMDB_API_KEY', '' );
 
 final class Lunara_IMDb_Guard {
 
-	const OPTION_API_KEY      = 'lunara_imdb_guard_omdb_api_key';
-	const OPTION_TMDB_API_KEY = 'lunara_imdb_guard_tmdb_api_key';
-	const OPTION_TITLE_MAP = 'lunara_imdb_guard_title_map_v1';
+	const OPTION_API_KEY             = 'lunara_imdb_guard_omdb_api_key';
+	const OPTION_TMDB_API_KEY        = 'lunara_imdb_guard_tmdb_api_key';
+	const OPTION_TITLE_MAP           = 'lunara_imdb_guard_title_map_v1';
 	const OPTION_TITLE_MAP_MIGRATION = 'lunara_imdb_guard_title_map_migration_v1';
-	const OPTION_TITLE_MAP_LOCK = 'lunara_imdb_guard_title_map_lock_v1';
-	const OPTION_HEALTH_SNAPSHOT = 'lunara_imdb_guard_health_snapshot_v1';
-	const TITLE_MAP_SCHEMA_VERSION = 1;
+	const OPTION_TITLE_MAP_LOCK      = 'lunara_imdb_guard_title_map_lock_v1';
+	const OPTION_HEALTH_SNAPSHOT    = 'lunara_imdb_guard_health_snapshot_v1';
+	const TITLE_MAP_SCHEMA_VERSION  = 1;
 	const HEALTH_SNAPSHOT_SCHEMA_VERSION = 1;
-	const LEGACY_MAP_MAX_BYTES = 1048576;
-	const LEGACY_MAP_MAX_ENTRIES = 5000;
+	const LEGACY_MAP_MAX_BYTES      = 1048576;
+	const LEGACY_MAP_MAX_ENTRIES    = 5000;
 	const META_STATUS    = '_lunara_imdb_guard_status';
 	const META_MESSAGE   = '_lunara_imdb_guard_message';
 	const META_EXPECTED  = '_lunara_imdb_guard_expected_id';
@@ -1841,11 +1841,39 @@ final class Lunara_IMDb_Guard {
 	 * @return array|null
 	 */
 	private function read_legacy_title_map() {
-		$path = trailingslashit( get_stylesheet_directory() ) . 'assets/data/imdb-title-map.json';
-		if ( ! is_file( $path ) ) {
-			return null;
+		$root       = trailingslashit( get_stylesheet_directory() );
+		$candidates = array(
+			$root . 'assets/data/imdb-title-map.json',
+			$root . 'imdb-title-map.json',
+		);
+		$legacy = null;
+		$found  = false;
+
+		foreach ( $candidates as $path ) {
+			if ( ! is_file( $path ) ) {
+				continue;
+			}
+			$candidate = $this->read_legacy_title_map_file( $path );
+			if ( null === $candidate ) {
+				return null;
+			}
+			if ( $found && $legacy !== $candidate ) {
+				return null;
+			}
+			$legacy = $candidate;
+			$found  = true;
 		}
 
+		return $found ? $legacy : null;
+	}
+
+	/**
+	 * Read one already-bounded legacy candidate all-or-nothing.
+	 *
+	 * @param string $path Candidate path within the active stylesheet.
+	 * @return array|null
+	 */
+	private function read_legacy_title_map_file( $path ) {
 		$size = filesize( $path );
 		if ( false !== $size && $size > self::LEGACY_MAP_MAX_BYTES ) {
 			return null;
@@ -2044,7 +2072,7 @@ final class Lunara_IMDb_Guard {
 	}
 
 	/**
-	 * Build the theme map key.
+	 * Build the canonical title-map key.
 	 *
 	 * @param string $title Review title.
 	 * @param string $year  Review year.
