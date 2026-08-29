@@ -8,11 +8,15 @@
 declare( strict_types=1 );
 
 define( 'ABSPATH', __DIR__ . '/' );
+define( 'ARRAY_A', 'ARRAY_A' );
 
 $GLOBALS['lunara_test_options']              = array();
+$GLOBALS['lunara_test_autoload']             = array();
+$GLOBALS['lunara_test_option_ids']           = array();
+$GLOBALS['lunara_test_raw_option_values']    = array();
+$GLOBALS['lunara_test_next_option_id']       = 1;
 $GLOBALS['lunara_test_option_mutations']     = array();
 $GLOBALS['lunara_test_add_behaviors']        = array();
-$GLOBALS['lunara_test_add_observers']        = array();
 $GLOBALS['lunara_test_actions']              = array();
 $GLOBALS['lunara_test_activation_hooks']     = array();
 $GLOBALS['lunara_test_stylesheet_directory'] = sys_get_temp_dir() . '/lunara-imdb-guard-missing-theme';
@@ -24,21 +28,88 @@ $GLOBALS['lunara_test_titles']               = array();
 $GLOBALS['lunara_test_content']              = array();
 $GLOBALS['lunara_test_transients']           = array();
 $GLOBALS['lunara_test_cache_deletes']        = array();
+$GLOBALS['lunara_test_cas_observer']         = null;
+$GLOBALS['lunara_test_raw_read_observer']    = null;
+$GLOBALS['lunara_test_cas_db_error']         = false;
+
+function lunara_test_raw_autoload( $value ): string {
+	if ( false === $value ) {
+		return 'no';
+	}
+	if ( true === $value ) {
+		return 'yes';
+	}
+	return (string) $value;
+}
 
 final class Lunara_Test_WPDB {
 	public $options = 'wp_options';
-	public $conditional_deletes = array();
+	public $cas_updates = array();
+	public $prepared_statements = array();
+	public $raw_reads = 0;
 
-	public function delete( string $table, array $where, array $formats ) {
-		$this->conditional_deletes[] = array( $table, $where, $formats );
-		$option = $where['option_name'] ?? '';
+	public function prepare( string $query, ...$args ): array {
+		$statement = array( 'sql' => $query, 'args' => $args );
+		$this->prepared_statements[] = $statement;
+		return $statement;
+	}
+
+	public function get_row( array $statement, string $output ) {
+		$this->raw_reads++;
+		if ( is_callable( $GLOBALS['lunara_test_raw_read_observer'] ) ) {
+			$GLOBALS['lunara_test_raw_read_observer']( $this->raw_reads, $statement );
+		}
+
+		$option = $statement['args'][0] ?? '';
+		if ( ! array_key_exists( $option, $GLOBALS['lunara_test_options'] ) ) {
+			return null;
+		}
+		if ( ! isset( $GLOBALS['lunara_test_option_ids'][ $option ] ) ) {
+			$GLOBALS['lunara_test_option_ids'][ $option ] = $GLOBALS['lunara_test_next_option_id']++;
+		}
+
+		return array(
+			'option_id'    => (string) $GLOBALS['lunara_test_option_ids'][ $option ],
+			'option_value' => $GLOBALS['lunara_test_raw_option_values'][ $option ] ?? maybe_serialize( $GLOBALS['lunara_test_options'][ $option ] ),
+			'autoload'     => lunara_test_raw_autoload( $GLOBALS['lunara_test_autoload'][ $option ] ?? 'no' ),
+		);
+	}
+
+	public function query( array $statement ) {
+		$this->cas_updates[] = $statement;
+		if ( is_callable( $GLOBALS['lunara_test_cas_observer'] ) ) {
+			$GLOBALS['lunara_test_cas_observer']( count( $this->cas_updates ), $statement );
+		}
+		if ( $GLOBALS['lunara_test_cas_db_error'] ) {
+			return false;
+		}
+
+		$sql              = $statement['sql'];
+		$args             = $statement['args'];
+		$replacement_raw  = $args[0] ?? '';
+		$expected_id      = (string) ( $args[1] ?? '' );
+		$option           = $args[2] ?? '';
+		$expected_raw     = $args[3] ?? '';
+		$expected_autoload = (string) ( $args[4] ?? '' );
 		if ( ! array_key_exists( $option, $GLOBALS['lunara_test_options'] ) ) {
 			return 0;
 		}
-		if ( maybe_serialize( $GLOBALS['lunara_test_options'][ $option ] ) !== ( $where['option_value'] ?? null ) ) {
+
+		$current_id       = (string) ( $GLOBALS['lunara_test_option_ids'][ $option ] ?? '' );
+		$current_raw      = $GLOBALS['lunara_test_raw_option_values'][ $option ] ?? maybe_serialize( $GLOBALS['lunara_test_options'][ $option ] );
+		$current_autoload = lunara_test_raw_autoload( $GLOBALS['lunara_test_autoload'][ $option ] ?? 'no' );
+		if ( false !== strpos( $sql, 'option_id = %d' ) && $current_id !== $expected_id ) {
 			return 0;
 		}
-		unset( $GLOBALS['lunara_test_options'][ $option ] );
+		if ( false !== strpos( $sql, 'BINARY option_value = BINARY %s' ) && $current_raw !== $expected_raw ) {
+			return 0;
+		}
+		if ( false !== strpos( $sql, 'BINARY autoload = BINARY %s' ) && $current_autoload !== $expected_autoload ) {
+			return 0;
+		}
+
+		$GLOBALS['lunara_test_raw_option_values'][ $option ] = $replacement_raw;
+		$GLOBALS['lunara_test_options'][ $option ] = maybe_unserialize( $replacement_raw );
 		return 1;
 	}
 }
@@ -74,10 +145,6 @@ function add_option( string $option, $value = '', $deprecated = '', $autoload = 
 		'value'     => $value,
 		'autoload'  => $autoload,
 	);
-	if ( isset( $GLOBALS['lunara_test_add_observers'][ $option ] ) ) {
-		$GLOBALS['lunara_test_add_observers'][ $option ]( $option, $value, $autoload );
-	}
-
 	if ( isset( $GLOBALS['lunara_test_add_behaviors'][ $option ] ) ) {
 		$behavior = $GLOBALS['lunara_test_add_behaviors'][ $option ];
 		unset( $GLOBALS['lunara_test_add_behaviors'][ $option ] );
@@ -89,6 +156,9 @@ function add_option( string $option, $value = '', $deprecated = '', $autoload = 
 	}
 
 	$GLOBALS['lunara_test_options'][ $option ] = $value;
+	$GLOBALS['lunara_test_autoload'][ $option ] = $autoload;
+	$GLOBALS['lunara_test_option_ids'][ $option ] = $GLOBALS['lunara_test_next_option_id']++;
+	unset( $GLOBALS['lunara_test_raw_option_values'][ $option ] );
 	return true;
 }
 
@@ -100,6 +170,13 @@ function update_option( string $option, $value, $autoload = null ): bool {
 		'autoload'  => $autoload,
 	);
 	$GLOBALS['lunara_test_options'][ $option ] = $value;
+	if ( ! isset( $GLOBALS['lunara_test_option_ids'][ $option ] ) ) {
+		$GLOBALS['lunara_test_option_ids'][ $option ] = $GLOBALS['lunara_test_next_option_id']++;
+	}
+	unset( $GLOBALS['lunara_test_raw_option_values'][ $option ] );
+	if ( null !== $autoload ) {
+		$GLOBALS['lunara_test_autoload'][ $option ] = $autoload;
+	}
 	return true;
 }
 
@@ -109,11 +186,20 @@ function delete_option( string $option ): bool {
 		'option'    => $option,
 	);
 	unset( $GLOBALS['lunara_test_options'][ $option ] );
+	unset( $GLOBALS['lunara_test_autoload'][ $option ], $GLOBALS['lunara_test_option_ids'][ $option ], $GLOBALS['lunara_test_raw_option_values'][ $option ] );
 	return true;
 }
 
 function maybe_serialize( $value ): string {
 	return is_array( $value ) || is_object( $value ) ? serialize( $value ) : (string) $value;
+}
+
+function maybe_unserialize( $value ) {
+	if ( ! is_string( $value ) || '' === $value ) {
+		return $value;
+	}
+	$unserialized = @unserialize( $value );
+	return false === $unserialized && 'b:0;' !== $value ? $value : $unserialized;
 }
 
 function wp_cache_delete( string $key, string $group = '' ): bool {
@@ -203,9 +289,12 @@ function lunara_test_assert_same( $expected, $actual, string $message ): void {
 
 function lunara_test_reset(): void {
 	$GLOBALS['lunara_test_options']          = array();
+	$GLOBALS['lunara_test_autoload']         = array();
+	$GLOBALS['lunara_test_option_ids']       = array();
+	$GLOBALS['lunara_test_raw_option_values'] = array();
+	$GLOBALS['lunara_test_next_option_id']   = 1;
 	$GLOBALS['lunara_test_option_mutations'] = array();
 	$GLOBALS['lunara_test_add_behaviors']    = array();
-	$GLOBALS['lunara_test_add_observers']    = array();
 	$GLOBALS['lunara_test_stylesheet_reads'] = 0;
 	$GLOBALS['lunara_test_review_ids']       = array();
 	$GLOBALS['lunara_test_meta']             = array();
@@ -214,7 +303,12 @@ function lunara_test_reset(): void {
 	$GLOBALS['lunara_test_content']          = array();
 	$GLOBALS['lunara_test_transients']       = array();
 	$GLOBALS['lunara_test_cache_deletes']    = array();
-	$GLOBALS['wpdb']->conditional_deletes    = array();
+	$GLOBALS['lunara_test_cas_observer']     = null;
+	$GLOBALS['lunara_test_raw_read_observer'] = null;
+	$GLOBALS['lunara_test_cas_db_error']     = false;
+	$GLOBALS['wpdb']->cas_updates            = array();
+	$GLOBALS['wpdb']->prepared_statements    = array();
+	$GLOBALS['wpdb']->raw_reads              = 0;
 }
 
 function lunara_test_invoke_private( object $object, string $method, array $arguments = array() ) {
@@ -392,43 +486,21 @@ lunara_test_assert_same(
 lunara_test_assert_same( $theme_file_before, file_get_contents( $root . '/assets/data/imdb-title-map.json' ), 'Canonical mutation must never write the legacy theme file.' );
 lunara_test_assert_same( 0, $GLOBALS['lunara_test_stylesheet_reads'], 'Canonical mutation and public reads must not resolve theme paths.' );
 
-// A concurrent canonical update that lands before lock acquisition is re-read and preserved.
+// A sibling write between read and compare-and-swap forces a retry that preserves both entries.
 lunara_test_reset();
+$legacy_lock_option = 'lunara_imdb_guard_title_map_lock_v1';
 $GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = array( 'first|2020' => 'tt1111111' );
-$GLOBALS['lunara_test_add_behaviors'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ] = static function ( string $option, $token ): bool {
-	$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ]['racer|2023'] = 'tt2222222';
-	$GLOBALS['lunara_test_options'][ $option ] = $token;
-	return true;
-};
-lunara_test_assert_same( true, lunara_test_invoke_private( $guard, 'sync_title_map_entry', array( 'Second', '2024', 'tt3333333' ) ), 'Locked mutation should verify its canonical readback.' );
-lunara_test_assert_same(
-	array(
-		'first|2020' => 'tt1111111',
-		'racer|2023' => 'tt2222222',
-		'second|2024'=> 'tt3333333',
-	),
-	lunara_imdb_guard_get_title_map(),
-	'Locked mutation must re-read and preserve a concurrent canonical update.'
-);
-
-// A live lock loser retries; once the owner merges and releases, the loser preserves every sibling.
-lunara_test_reset();
-$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = array( 'first|2020' => 'tt1111111' );
-$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ] = array(
-	'token'       => str_repeat( 'a', 32 ),
-	'acquired_at' => time(),
-	'expires_at'  => time() + 30,
-);
-$live_attempts = 0;
-$GLOBALS['lunara_test_add_observers'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ] = static function () use ( &$live_attempts ): void {
-	$live_attempts++;
-	if ( 2 === $live_attempts ) {
+$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = false;
+$GLOBALS['lunara_test_options'][ $legacy_lock_option ] = 'opaque-pre-cas-lock-state';
+$GLOBALS['lunara_test_cas_observer'] = static function ( int $attempt ): void {
+	if ( 1 === $attempt ) {
 		$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ]['owner|2023'] = 'tt2222222';
-		unset( $GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ] );
+		unset( $GLOBALS['lunara_test_raw_option_values'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] );
+		ksort( $GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ], SORT_NATURAL | SORT_FLAG_CASE );
 	}
 };
-lunara_test_assert_same( true, lunara_test_invoke_private( $guard, 'sync_title_map_entry', array( 'Loser', '2024', 'tt3333333' ) ), 'A live lock loser must retry and merge after the owner releases.' );
-lunara_test_assert( $live_attempts >= 2, 'Live contention must make more than one bounded acquisition attempt.' );
+lunara_test_assert_same( true, lunara_test_invoke_private( $guard, 'sync_title_map_entry', array( 'Loser', '2024', 'tt3333333' ) ), 'A legacy opaque lock must not block a canonical CAS mutation.' );
+lunara_test_assert_same( 2, count( $GLOBALS['wpdb']->cas_updates ), 'The first CAS conflict must retry instead of abandoning the distinct entry.' );
 lunara_test_assert_same(
 	array(
 		'first|2020' => 'tt1111111',
@@ -436,61 +508,125 @@ lunara_test_assert_same(
 		'owner|2023' => 'tt2222222',
 	),
 	lunara_imdb_guard_get_title_map(),
-	'The losing writer must re-read and preserve the live owner\'s sibling entry.'
+	'CAS retry must re-read and preserve both the sibling and pending entries.'
 );
-$lock_adds = array_values(
-	array_filter(
-		$GLOBALS['lunara_test_option_mutations'],
-		static fn( array $mutation ): bool => 'add' === ( $mutation['operation'] ?? '' ) && Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK === ( $mutation['option'] ?? '' )
-	)
+lunara_test_assert_same( 'opaque-pre-cas-lock-state', $GLOBALS['lunara_test_options'][ $legacy_lock_option ], 'Opaque legacy lock state must be irrelevant to canonical mutation.' );
+lunara_test_assert_same( false, $GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ], 'CAS must preserve the canonical option autoload column.' );
+$successful_cas = $GLOBALS['wpdb']->cas_updates[1] ?? array();
+$cas_sql = $successful_cas['sql'] ?? '';
+$cas_args = $successful_cas['args'] ?? array();
+lunara_test_assert( false !== strpos( $cas_sql, 'SET option_value = %s' ), 'CAS must update only option_value so autoload is preserved.' );
+lunara_test_assert( false !== strpos( $cas_sql, 'option_id = %d' ), 'CAS must fence against delete/recreate ABA with the exact physical row ID.' );
+lunara_test_assert( false !== strpos( $cas_sql, 'option_name = %s' ), 'CAS must target only the canonical map row name.' );
+lunara_test_assert( false !== strpos( $cas_sql, 'BINARY option_value = BINARY %s' ), 'CAS must compare raw option bytes without collation coercion.' );
+lunara_test_assert( false !== strpos( $cas_sql, 'BINARY autoload = BINARY %s' ), 'CAS must fence concurrent autoload changes without writing autoload.' );
+lunara_test_assert( false !== strpos( $cas_sql, 'LIMIT 1' ), 'CAS must remain constrained to one exact physical row.' );
+lunara_test_assert_same( Lunara_IMDb_Guard::OPTION_TITLE_MAP, $cas_args[2] ?? '', 'CAS must bind the canonical map name.' );
+lunara_test_assert_same(
+	maybe_serialize(
+		array(
+			'first|2020' => 'tt1111111',
+			'owner|2023' => 'tt2222222',
+		)
+	),
+	$cas_args[3] ?? '',
+	'CAS retry must compare the exact re-read serialized value.'
 );
-$created_lock = $lock_adds[ count( $lock_adds ) - 1 ] ?? array();
-lunara_test_assert_same( false, $created_lock['autoload'] ?? null, 'Every mutation lock acquisition must remain non-autoloaded.' );
-lunara_test_assert_same( array( 'token', 'acquired_at', 'expires_at' ), array_keys( $created_lock['value'] ?? array() ), 'A mutation lock must contain only the strict owner token and timestamps.' );
-lunara_test_assert( 1 === preg_match( '/^[a-f0-9]{32}$/', $created_lock['value']['token'] ?? '' ), 'A mutation lock token must use the strict opaque format.' );
-lunara_test_assert( is_int( $created_lock['value']['acquired_at'] ?? null ) && is_int( $created_lock['value']['expires_at'] ?? null ), 'Mutation lock timestamps must be integers.' );
-lunara_test_assert( $created_lock['value']['expires_at'] > $created_lock['value']['acquired_at'], 'Mutation lock expiry must be later than acquisition.' );
+lunara_test_assert_same( 'no', $cas_args[4] ?? '', 'CAS must compare the exact raw autoload value.' );
+foreach ( array( Lunara_IMDb_Guard::OPTION_TITLE_MAP, 'notoptions', 'alloptions' ) as $cache_key ) {
+	lunara_test_assert( in_array( array( $cache_key, 'options' ), $GLOBALS['lunara_test_cache_deletes'], true ), 'Winning CAS must invalidate the ' . $cache_key . ' options cache.' );
+}
 
-// An expired strict lock is reclaimed with a conditional compare-and-delete before retry.
+// A former writer cannot overwrite a sibling committed after its stale read.
 lunara_test_reset();
-$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = array( 'first|2020' => 'tt1111111' );
-$expired_lock = array(
-	'token'       => str_repeat( 'b', 32 ),
-	'acquired_at' => time() - 30,
-	'expires_at'  => time() - 1,
+$stale_read = array( 'first|2020' => 'tt1111111' );
+$sibling_commit = array(
+	'first|2020'   => 'tt1111111',
+	'sibling|2023' => 'tt2222222',
 );
-$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ] = $expired_lock;
-lunara_test_assert_same( true, lunara_test_invoke_private( $guard, 'sync_title_map_entry', array( 'Recovered', '2024', 'tt4444444' ) ), 'An expired lock must be safely reclaimed and the pending entry merged.' );
-lunara_test_assert_same( 'tt4444444', lunara_imdb_guard_lookup_title_id( 'Recovered', '2024' ), 'Stale recovery must preserve exact canonical readback.' );
-lunara_test_assert( count( $GLOBALS['wpdb']->conditional_deletes ) >= 2, 'Stale recovery and owner release must both use conditional database deletes.' );
-lunara_test_assert_same( maybe_serialize( $expired_lock ), $GLOBALS['wpdb']->conditional_deletes[0][1]['option_value'] ?? '', 'Stale recovery must compare the exact observed lock record.' );
+$stale_write = array(
+	'first|2020' => 'tt1111111',
+	'stale|2024' => 'tt3333333',
+);
+$stale_snapshot = array(
+	'option_id'    => '17',
+	'option_value' => maybe_serialize( $stale_read ),
+	'autoload'     => 'no',
+	'map'          => $stale_read,
+);
+$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = $sibling_commit;
+$GLOBALS['lunara_test_option_ids'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = 17;
+$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = false;
+lunara_test_assert_same( 0, lunara_test_invoke_private( $guard, 'compare_and_swap_title_map', array( $stale_snapshot, $stale_write, 'stale|2024', 'tt3333333' ) ), 'A stale former writer must lose its fenced CAS after a sibling commit.' );
+lunara_test_assert_same( $sibling_commit, lunara_imdb_guard_get_title_map(), 'A stale writer must never overwrite the sibling commit.' );
+lunara_test_assert_same( false, $GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ], 'A failed stale CAS must leave autoload unchanged.' );
 
-// Releasing one owner can never delete a replacement owner's live lock.
+// Delete/recreate ABA and autoload-only races are fenced independently of value bytes.
 lunara_test_reset();
-$original_lock = array(
-	'token'       => str_repeat( 'c', 32 ),
-	'acquired_at' => time(),
-	'expires_at'  => time() + 5,
-);
-$replacement_lock = array(
-	'token'       => str_repeat( 'd', 32 ),
-	'acquired_at' => time() + 1,
-	'expires_at'  => time() + 6,
-);
-$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ] = $replacement_lock;
-lunara_test_assert_same( false, lunara_test_invoke_private( $guard, 'release_title_map_lock', array( $original_lock ) ), 'A former owner must not release a replacement owner\'s lock.' );
-lunara_test_assert_same( $replacement_lock, $GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ], 'Owner-token-only release must preserve the replacement lock exactly.' );
+$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = $stale_read;
+$GLOBALS['lunara_test_option_ids'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = 18;
+$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = false;
+lunara_test_assert_same( 0, lunara_test_invoke_private( $guard, 'compare_and_swap_title_map', array( $stale_snapshot, $stale_write, 'stale|2024', 'tt3333333' ) ), 'A recreated row with identical name/value/autoload bytes must still defeat the former row snapshot.' );
+lunara_test_assert_same( $stale_read, lunara_imdb_guard_get_title_map(), 'Row-ID ABA protection must preserve the recreated row.' );
 
-// Terminal contention is surfaced by both canonical sync outcomes in validation.
+lunara_test_reset();
+$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = $stale_read;
+$GLOBALS['lunara_test_option_ids'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = 17;
+$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = 'yes';
+lunara_test_assert_same( 0, lunara_test_invoke_private( $guard, 'compare_and_swap_title_map', array( $stale_snapshot, $stale_write, 'stale|2024', 'tt3333333' ) ), 'An autoload-only race must defeat the stale physical-row snapshot.' );
+lunara_test_assert_same( 'yes', $GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ], 'CAS must never overwrite a concurrent autoload change.' );
+
+// The CAS compares exact selected bytes, and intent readback tolerates a later sibling merge.
+lunara_test_reset();
+$shared_id_raw = 'a:2:{s:10:"first|2020";s:9:"tt1111111";s:11:"second|2021";R:2;}';
+$shared_id_map = array(
+	'first|2020'  => 'tt1111111',
+	'second|2021' => 'tt1111111',
+);
+$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = $shared_id_map;
+$GLOBALS['lunara_test_option_ids'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = 21;
+$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = false;
+$GLOBALS['lunara_test_raw_option_values'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = $shared_id_raw;
+$raw_snapshot = lunara_test_invoke_private( $guard, 'read_title_map_row' );
+lunara_test_assert_same( $shared_id_raw, $raw_snapshot['option_value'] ?? '', 'Mutation snapshot must preserve the exact physical option bytes instead of reserializing decoded data.' );
+$merged_map = $shared_id_map;
+$merged_map['third|2024'] = 'tt3333333';
+$GLOBALS['lunara_test_raw_read_observer'] = static function ( int $read ) use ( $merged_map ): void {
+	if ( 2 === $read ) {
+		$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = $merged_map + array( 'winner sibling|2025' => 'tt4444444' );
+		ksort( $GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ], SORT_NATURAL | SORT_FLAG_CASE );
+		unset( $GLOBALS['lunara_test_raw_option_values'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] );
+	}
+};
+lunara_test_assert_same( 1, lunara_test_invoke_private( $guard, 'compare_and_swap_title_map', array( $raw_snapshot, $merged_map, 'third|2024', 'tt3333333' ) ), 'A winning CAS must verify its intended entry while tolerating a later sibling merge.' );
+lunara_test_assert_same( $shared_id_raw, $GLOBALS['wpdb']->cas_updates[0]['args'][3] ?? '', 'CAS must bind exact selected raw bytes in the BINARY comparison.' );
+lunara_test_assert_same( 'tt4444444', lunara_imdb_guard_lookup_title_id( 'Winner Sibling', '2025' ), 'Post-win readback must preserve and accept a later sibling merge.' );
+
+// A database error is terminal, while a valid empty physical map remains mutable.
+lunara_test_reset();
+$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = $stale_read;
+$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = false;
+$GLOBALS['lunara_test_cas_db_error'] = true;
+lunara_test_assert_same( false, lunara_test_invoke_private( $guard, 'sync_title_map_entry', array( 'No Spin', '2024', 'tt5555555' ) ), 'A database CAS error must fail closed.' );
+lunara_test_assert_same( 1, count( $GLOBALS['wpdb']->cas_updates ), 'A database CAS error must terminate without retry spinning.' );
+
+lunara_test_reset();
+$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = array();
+$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = false;
+lunara_test_assert_same( true, lunara_test_invoke_private( $guard, 'sync_title_map_entry', array( 'First Film', '2024', 'tt5555555' ) ), 'A present canonical empty map must accept its first CAS entry.' );
+lunara_test_assert_same( array( 'first film|2024' => 'tt5555555' ), lunara_imdb_guard_get_title_map(), 'Empty-map mutation must persist only the intended normalized entry.' );
+
+// Repeated CAS conflicts terminate and are surfaced by both canonical sync outcomes in validation.
 foreach ( array( 'verified' => false, 'autofilled' => true ) as $label => $auto_fill ) {
 	lunara_test_reset();
 	$post_id = 'verified' === $label ? 90 : 91;
 	$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = array( 'existing|2020' => 'tt1111111' );
-	$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP_LOCK ] = array(
-		'token'       => str_repeat( 'e', 32 ),
-		'acquired_at' => time(),
-		'expires_at'  => time() + 30,
-	);
+	$GLOBALS['lunara_test_autoload'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] = false;
+	$GLOBALS['lunara_test_cas_observer'] = static function ( int $attempt ): void {
+		$GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ][ 'racer ' . $attempt . '|2023' ] = sprintf( 'tt%07d', $attempt );
+		unset( $GLOBALS['lunara_test_raw_option_values'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ] );
+		ksort( $GLOBALS['lunara_test_options'][ Lunara_IMDb_Guard::OPTION_TITLE_MAP ], SORT_NATURAL | SORT_FLAG_CASE );
+	};
 	$GLOBALS['lunara_test_titles'][ $post_id ] = 'Blocked Film';
 	$GLOBALS['lunara_test_meta'][ $post_id ] = array(
 		'_lunara_year'          => '2024',
@@ -503,8 +639,10 @@ foreach ( array( 'verified' => false, 'autofilled' => true ) as $label => $auto_
 		'imdb_id' => 'tt5555555',
 	);
 	$validation = lunara_test_invoke_private( $guard, 'validate_review', array( $post_id, $auto_fill ) );
-	lunara_test_assert_same( 'error', $validation['status'], 'Terminal lock contention must not report ' . $label . ' canonical sync as successful.' );
-	lunara_test_assert_same( 'error', $GLOBALS['lunara_test_meta'][ $post_id ][ Lunara_IMDb_Guard::META_STATUS ] ?? '', 'Terminal contention must persist a visible error for the ' . $label . ' call site.' );
+	lunara_test_assert_same( 'error', $validation['status'], 'Terminal CAS contention must not report ' . $label . ' canonical sync as successful.' );
+	lunara_test_assert_same( 'error', $GLOBALS['lunara_test_meta'][ $post_id ][ Lunara_IMDb_Guard::META_STATUS ] ?? '', 'Terminal CAS contention must persist a visible error for the ' . $label . ' call site.' );
+	lunara_test_assert_same( Lunara_IMDb_Guard::TITLE_MAP_CAS_ATTEMPTS, count( $GLOBALS['wpdb']->cas_updates ), 'Terminal CAS contention must exhaust the bounded retry budget for the ' . $label . ' call site.' );
+	lunara_test_assert( false === strpos( $validation['message'], Lunara_IMDb_Guard::OPTION_TITLE_MAP ), 'Terminal CAS failure must not expose the canonical option name.' );
 }
 
 lunara_test_reset();

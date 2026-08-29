@@ -26,15 +26,12 @@ final class Lunara_IMDb_Guard {
 	const OPTION_TMDB_API_KEY        = 'lunara_imdb_guard_tmdb_api_key';
 	const OPTION_TITLE_MAP           = 'lunara_imdb_guard_title_map_v1';
 	const OPTION_TITLE_MAP_MIGRATION = 'lunara_imdb_guard_title_map_migration_v1';
-	const OPTION_TITLE_MAP_LOCK      = 'lunara_imdb_guard_title_map_lock_v1';
 	const OPTION_HEALTH_SNAPSHOT    = 'lunara_imdb_guard_health_snapshot_v1';
 	const TITLE_MAP_SCHEMA_VERSION  = 1;
 	const HEALTH_SNAPSHOT_SCHEMA_VERSION = 1;
 	const LEGACY_MAP_MAX_BYTES      = 1048576;
 	const LEGACY_MAP_MAX_ENTRIES    = 5000;
-	const TITLE_MAP_LOCK_TTL        = 5;
-	const TITLE_MAP_LOCK_ATTEMPTS   = 5;
-	const TITLE_MAP_LOCK_RETRY_US   = 10000;
+	const TITLE_MAP_CAS_ATTEMPTS    = 5;
 	const META_STATUS    = '_lunara_imdb_guard_status';
 	const META_MESSAGE   = '_lunara_imdb_guard_message';
 	const META_EXPECTED  = '_lunara_imdb_guard_expected_id';
@@ -2008,135 +2005,141 @@ final class Lunara_IMDb_Guard {
 			return false;
 		}
 
-		$map = $this->get_title_map();
-		if ( ! is_array( $map ) ) {
-			return false;
-		}
-
-		$lock = $this->acquire_title_map_lock();
-		if ( ! is_array( $lock ) ) {
-			$current = $this->get_title_map();
-			return is_array( $current ) && isset( $current[ $key ] ) && $imdb_id === $current[ $key ];
-		}
-
-		try {
-			$current = $this->get_title_map();
-			if ( ! is_array( $current ) ) {
+		for ( $attempt = 0; $attempt < self::TITLE_MAP_CAS_ATTEMPTS; $attempt++ ) {
+			$snapshot = $this->read_title_map_row();
+			if ( ! is_array( $snapshot ) ) {
 				return false;
 			}
-
-			$current[ $key ] = $imdb_id;
-			ksort( $current, SORT_NATURAL | SORT_FLAG_CASE );
-			update_option( self::OPTION_TITLE_MAP, $current, false );
-
-			return $current === $this->get_title_map();
-		} finally {
-			$this->release_title_map_lock( $lock );
-		}
-	}
-
-	/**
-	 * Acquire the canonical-map mutation lock with bounded live-owner retries.
-	 *
-	 * @return array|null
-	 */
-	private function acquire_title_map_lock() {
-		for ( $attempt = 0; $attempt < self::TITLE_MAP_LOCK_ATTEMPTS; $attempt++ ) {
-			$now  = time();
-			$lock = array(
-				'token'       => md5( uniqid( 'lunara-title-map-lock-', true ) . mt_rand() ),
-				'acquired_at' => $now,
-				'expires_at'  => $now + self::TITLE_MAP_LOCK_TTL,
-			);
-			if ( add_option( self::OPTION_TITLE_MAP_LOCK, $lock, '', false ) ) {
-				return $lock;
+			$current = $snapshot['map'];
+			if ( isset( $current[ $key ] ) && $imdb_id === $current[ $key ] ) {
+				return true;
 			}
 
-			$sentinel = self::option_sentinel();
-			$observed = get_option( self::OPTION_TITLE_MAP_LOCK, $sentinel );
-			$valid    = $this->normalize_title_map_lock( $observed );
-			if ( is_array( $valid ) && $observed === $valid && $valid['expires_at'] <= $now ) {
-				$this->compare_and_delete_title_map_lock( $valid );
-				continue;
+			$next         = $current;
+			$next[ $key ] = $imdb_id;
+			ksort( $next, SORT_NATURAL | SORT_FLAG_CASE );
+			$swapped = $this->compare_and_swap_title_map( $snapshot, $next, $key, $imdb_id );
+			if ( false === $swapped ) {
+				return false;
 			}
-
-			if ( $attempt + 1 < self::TITLE_MAP_LOCK_ATTEMPTS ) {
-				usleep( self::TITLE_MAP_LOCK_RETRY_US );
+			if ( 1 === $swapped ) {
+				return true;
 			}
 		}
 
-		return null;
+		return false;
 	}
 
 	/**
-	 * Validate a strict time-bounded lock record.
+	 * Read one exact physical canonical option row for a mutation attempt.
 	 *
-	 * @param mixed $lock Candidate lock value.
 	 * @return array|null
 	 */
-	private function normalize_title_map_lock( $lock ) {
-		if ( ! is_array( $lock ) || 3 !== count( $lock ) ) {
+	private function read_title_map_row() {
+		global $wpdb;
+
+		if ( ! isset( $wpdb->options )
+			|| ! is_callable( array( $wpdb, 'prepare' ) )
+			|| ! is_callable( array( $wpdb, 'get_row' ) ) ) {
 			return null;
 		}
-		$keys = array_keys( $lock );
-		sort( $keys, SORT_STRING );
-		if ( array( 'acquired_at', 'expires_at', 'token' ) !== $keys
-			|| ! is_string( $lock['token'] )
-			|| ! preg_match( '/^[a-f0-9]{32}$/', $lock['token'] )
-			|| ! is_int( $lock['acquired_at'] )
-			|| ! is_int( $lock['expires_at'] )
-			|| $lock['acquired_at'] <= 0
-			|| $lock['expires_at'] <= $lock['acquired_at']
-			|| $lock['expires_at'] - $lock['acquired_at'] > 60 ) {
+
+		$row = $wpdb->get_row(
+			$wpdb->prepare(
+				"SELECT option_id, option_value, autoload FROM {$wpdb->options} WHERE option_name = %s LIMIT 1",
+				self::OPTION_TITLE_MAP
+			),
+			ARRAY_A
+		);
+		if ( ! is_array( $row )
+			|| ! isset( $row['option_id'], $row['option_value'], $row['autoload'] )
+			|| ! is_scalar( $row['option_id'] )
+			|| ! ctype_digit( (string) $row['option_id'] )
+			|| '0' === (string) $row['option_id']
+			|| ! is_string( $row['option_value'] )
+			|| ! is_string( $row['autoload'] ) ) {
+			return null;
+		}
+
+		$decoded    = maybe_unserialize( $row['option_value'] );
+		$normalized = $this->normalize_title_map( $decoded );
+		if ( null === $normalized || $decoded !== $normalized ) {
 			return null;
 		}
 
 		return array(
-			'token'       => $lock['token'],
-			'acquired_at' => $lock['acquired_at'],
-			'expires_at'  => $lock['expires_at'],
+			'option_id'    => (string) $row['option_id'],
+			'option_value' => $row['option_value'],
+			'autoload'     => $row['autoload'],
+			'map'          => $normalized,
 		);
 	}
 
 	/**
-	 * Release only the exact lock record still owned by this writer.
+	 * Atomically replace one exact physical option row and verify intent.
 	 *
-	 * @param array $lock Expected owner record.
-	 * @return bool
+	 * @param array  $snapshot    Exact physical row snapshot.
+	 * @param array  $replacement Exact normalized merged map to store.
+	 * @param string $intent_key  Canonical entry key that must survive readback.
+	 * @param string $intent_id   Canonical IMDb ID that must survive readback.
+	 * @return int|false One for a verified win, zero for a conflict, false on error.
 	 */
-	private function release_title_map_lock( $lock ) {
-		$lock = $this->normalize_title_map_lock( $lock );
-		return is_array( $lock ) && $this->compare_and_delete_title_map_lock( $lock );
-	}
-
-	/**
-	 * Conditionally delete an unchanged lock row and invalidate its option cache.
-	 *
-	 * @param array $expected Exact observed lock record.
-	 * @return bool
-	 */
-	private function compare_and_delete_title_map_lock( $expected ) {
+	private function compare_and_swap_title_map( $snapshot, $replacement, $intent_key, $intent_id ) {
 		global $wpdb;
 
-		$expected = $this->normalize_title_map_lock( $expected );
-		if ( ! is_array( $expected ) || ! isset( $wpdb->options ) || ! is_callable( array( $wpdb, 'delete' ) ) ) {
+		$normalized_replacement = $this->normalize_title_map( $replacement );
+		$snapshot_map           = is_array( $snapshot ) ? ( $snapshot['map'] ?? null ) : null;
+		$decoded_snapshot       = is_array( $snapshot ) && is_string( $snapshot['option_value'] ?? null )
+			? maybe_unserialize( $snapshot['option_value'] )
+			: null;
+		if ( ! is_array( $snapshot )
+			|| array( 'option_id', 'option_value', 'autoload', 'map' ) !== array_keys( $snapshot )
+			|| ! is_string( $snapshot['option_id'] )
+			|| ! ctype_digit( $snapshot['option_id'] )
+			|| '0' === $snapshot['option_id']
+			|| ! is_string( $snapshot['option_value'] )
+			|| ! is_string( $snapshot['autoload'] )
+			|| ! is_array( $snapshot_map )
+			|| $decoded_snapshot !== $snapshot_map
+			|| $snapshot_map !== $this->normalize_title_map( $snapshot_map )
+			|| $replacement !== $normalized_replacement
+			|| ! is_string( $intent_key )
+			|| ! is_string( $intent_id )
+			|| ! isset( $replacement[ $intent_key ] )
+			|| $intent_id !== $replacement[ $intent_key ]
+			|| ! isset( $wpdb->options )
+			|| ! is_callable( array( $wpdb, 'prepare' ) )
+			|| ! is_callable( array( $wpdb, 'query' ) ) ) {
 			return false;
 		}
 
-		$deleted = $wpdb->delete(
-			$wpdb->options,
-			array(
-				'option_name'  => self::OPTION_TITLE_MAP_LOCK,
-				'option_value' => maybe_serialize( $expected ),
-			),
-			array( '%s', '%s' )
+		$updated = $wpdb->query(
+			$wpdb->prepare(
+				"UPDATE {$wpdb->options} SET option_value = %s WHERE option_id = %d AND option_name = %s AND BINARY option_value = BINARY %s AND BINARY autoload = BINARY %s LIMIT 1",
+				maybe_serialize( $replacement ),
+				$snapshot['option_id'],
+				self::OPTION_TITLE_MAP,
+				$snapshot['option_value'],
+				$snapshot['autoload']
+			)
 		);
-		wp_cache_delete( self::OPTION_TITLE_MAP_LOCK, 'options' );
-		if ( 1 !== (int) $deleted ) {
+		if ( false === $updated ) {
+			return false;
+		}
+		if ( 1 !== (int) $updated ) {
+			return 0;
+		}
+
+		wp_cache_delete( self::OPTION_TITLE_MAP, 'options' );
+		wp_cache_delete( 'notoptions', 'options' );
+		wp_cache_delete( 'alloptions', 'options' );
+
+		$readback = $this->read_title_map_row();
+		if ( ! is_array( $readback ) ) {
 			return false;
 		}
 
-		return true;
+		return isset( $readback['map'][ $intent_key ] ) && $intent_id === $readback['map'][ $intent_key ] ? 1 : 0;
 	}
 
 	/**
