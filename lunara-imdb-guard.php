@@ -3,7 +3,7 @@
  * Plugin Name: Lunara IMDb Guard
  * Plugin URI: https://lunarafilm.com/
  * Description: Validates review IMDb IDs against title and year, auto-fills clear matches, syncs TMDB poster/backdrop artwork, and provides an editorial audit screen for Lunara.
- * Version: 0.4.1
+ * Version: 0.4.2
  * Author: Lunara Film
  * Author URI: https://lunarafilm.com/
  * License: GPL v2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'LUNARA_IMDB_GUARD_VERSION', '0.4.1' );
+define( 'LUNARA_IMDB_GUARD_VERSION', '0.4.2' );
 define( 'LUNARA_IMDB_GUARD_FILE', __FILE__ );
 define( 'LUNARA_IMDB_GUARD_DIR', plugin_dir_path( __FILE__ ) );
 define( 'LUNARA_IMDB_GUARD_DEFAULT_OMDB_API_KEY', '' );
@@ -24,6 +24,14 @@ final class Lunara_IMDb_Guard {
 
 	const OPTION_API_KEY      = 'lunara_imdb_guard_omdb_api_key';
 	const OPTION_TMDB_API_KEY = 'lunara_imdb_guard_tmdb_api_key';
+	const OPTION_TITLE_MAP = 'lunara_imdb_guard_title_map_v1';
+	const OPTION_TITLE_MAP_MIGRATION = 'lunara_imdb_guard_title_map_migration_v1';
+	const OPTION_TITLE_MAP_LOCK = 'lunara_imdb_guard_title_map_lock_v1';
+	const OPTION_HEALTH_SNAPSHOT = 'lunara_imdb_guard_health_snapshot_v1';
+	const TITLE_MAP_SCHEMA_VERSION = 1;
+	const HEALTH_SNAPSHOT_SCHEMA_VERSION = 1;
+	const LEGACY_MAP_MAX_BYTES = 1048576;
+	const LEGACY_MAP_MAX_ENTRIES = 5000;
 	const META_STATUS    = '_lunara_imdb_guard_status';
 	const META_MESSAGE   = '_lunara_imdb_guard_message';
 	const META_EXPECTED  = '_lunara_imdb_guard_expected_id';
@@ -65,6 +73,7 @@ final class Lunara_IMDb_Guard {
 		add_action( 'save_post_review', array( $this, 'validate_review_on_save' ), 50, 3 );
 		add_action( 'admin_menu', array( $this, 'register_admin_page' ) );
 		add_action( 'admin_notices', array( $this, 'render_admin_notices' ) );
+		add_action( 'admin_init', array( $this, 'maybe_migrate_title_map' ) );
 
 		add_action( 'admin_post_lunara_imdb_guard_validate', array( $this, 'handle_validate_request' ) );
 		add_action( 'admin_post_lunara_imdb_guard_apply', array( $this, 'handle_apply_request' ) );
@@ -72,6 +81,249 @@ final class Lunara_IMDb_Guard {
 		add_action( 'admin_post_lunara_imdb_guard_fill_images', array( $this, 'handle_fill_images_request' ) );
 		add_action( 'admin_post_lunara_imdb_guard_save_settings', array( $this, 'handle_save_settings_request' ) );
 		add_action( 'admin_post_lunara_imdb_guard_export_manifest', array( $this, 'handle_export_manifest_request' ) );
+	}
+
+	/**
+	 * Run versioned storage migrations during activation.
+	 *
+	 * @return void
+	 */
+	public static function activate() {
+		self::instance()->maybe_migrate_title_map();
+	}
+
+	/**
+	 * Return a sanitized canonical title map.
+	 *
+	 * NULL means canonical storage is absent or invalid. An empty array is a
+	 * valid, intentionally empty map.
+	 *
+	 * @return array|null
+	 */
+	public function get_title_map(): ?array {
+		$sentinel = self::option_sentinel();
+		$stored   = get_option( self::OPTION_TITLE_MAP, $sentinel );
+
+		if ( $sentinel === $stored ) {
+			return null;
+		}
+
+		$normalized = $this->normalize_title_map( $stored );
+		if ( null === $normalized || $stored !== $normalized ) {
+			return null;
+		}
+
+		return $normalized;
+	}
+
+	/**
+	 * Look up a canonical IMDb ID by title and year.
+	 *
+	 * @param mixed $title Film title.
+	 * @param mixed $year  Four-digit release year.
+	 * @return string
+	 */
+	public function lookup_title_id( $title, $year = '' ): string {
+		if ( ! is_scalar( $title ) || ! is_scalar( $year ) ) {
+			return '';
+		}
+
+		$key = $this->build_map_key( (string) $title, (string) $year );
+		$map = $this->get_title_map();
+
+		return '' !== $key && is_array( $map ) && isset( $map[ $key ] ) ? $map[ $key ] : '';
+	}
+
+	/**
+	 * Return the canonical plugin-owned admin destination.
+	 *
+	 * @return string
+	 */
+	public function admin_url(): string {
+		return admin_url( 'edit.php?post_type=review&page=lunara-imdb-guard' );
+	}
+
+	/**
+	 * Return the capability that owns IMDb Guard operations.
+	 *
+	 * @return string
+	 */
+	public function admin_capability(): string {
+		return 'edit_posts';
+	}
+
+	/**
+	 * Import the active theme's bounded legacy title map exactly once.
+	 *
+	 * This method is hooked only to activation/admin upgrade traffic. Ordinary
+	 * map reads and Review mutations never call it or inspect the filesystem.
+	 *
+	 * @return bool
+	 */
+	public function maybe_migrate_title_map(): bool {
+		$sentinel = self::option_sentinel();
+		$stored   = get_option( self::OPTION_TITLE_MAP, $sentinel );
+
+		if ( $sentinel !== $stored ) {
+			$normalized = $this->normalize_title_map( $stored );
+			if ( null === $normalized || $stored !== $normalized ) {
+				return false;
+			}
+
+			return $this->mark_title_map_migration_complete();
+		}
+
+		$legacy = $this->read_legacy_title_map();
+		if ( null === $legacy ) {
+			return false;
+		}
+
+		$created = add_option( self::OPTION_TITLE_MAP, $legacy, '', false );
+		$readback = get_option( self::OPTION_TITLE_MAP, $sentinel );
+
+		if ( $created ) {
+			if ( $readback !== $legacy ) {
+				return false;
+			}
+		} else {
+			$winner = $this->normalize_title_map( $readback );
+			if ( null === $winner || $readback !== $winner ) {
+				return false;
+			}
+		}
+
+		return $this->mark_title_map_migration_complete();
+	}
+
+	/**
+	 * Return bounded identity/artwork health without scanning Review records.
+	 *
+	 * @return array
+	 */
+	public function health_status(): array {
+		$snapshot = $this->read_health_snapshot();
+		$identity = array(
+			'state'           => 'unknown',
+			'total'           => null,
+			'with_imdb_id'    => null,
+			'missing_imdb_id' => null,
+			'needs_review'    => null,
+		);
+		$artwork = array(
+			'state'    => 'unknown',
+			'eligible' => null,
+			'complete' => null,
+			'missing'  => null,
+		);
+
+		if ( is_array( $snapshot ) ) {
+			$identity = $snapshot['identity'];
+			$identity['state'] = 0 === $identity['missing_imdb_id'] && 0 === $identity['needs_review'] ? 'healthy' : 'needs_attention';
+			$identity = array_merge( array( 'state' => $identity['state'] ), array_diff_key( $identity, array( 'state' => true ) ) );
+
+			$artwork = $snapshot['artwork'];
+			$artwork['state'] = 0 === $artwork['missing'] ? 'healthy' : 'needs_attention';
+			$artwork = array_merge( array( 'state' => $artwork['state'] ), array_diff_key( $artwork, array( 'state' => true ) ) );
+		}
+
+		$sentinel  = self::option_sentinel();
+		$stored_map = get_option( self::OPTION_TITLE_MAP, $sentinel );
+		if ( $sentinel === $stored_map ) {
+			$title_map = array( 'state' => 'missing', 'entries' => null );
+		} else {
+			$normalized_map = $this->normalize_title_map( $stored_map );
+			$title_map = null !== $normalized_map && $stored_map === $normalized_map
+				? array( 'state' => 'ready', 'entries' => count( $normalized_map ) )
+				: array( 'state' => 'invalid', 'entries' => null );
+		}
+
+		$credentials = array(
+			'omdb_configured' => '' !== $this->get_api_key(),
+			'tmdb_configured' => '' !== $this->get_tmdb_api_key(),
+		);
+		$healthy = 'healthy' === $identity['state']
+			&& 'healthy' === $artwork['state']
+			&& 'ready' === $title_map['state']
+			&& $credentials['omdb_configured']
+			&& $credentials['tmdb_configured'];
+
+		return array(
+			'state'        => $healthy ? 'healthy' : 'needs_attention',
+			'identity'     => $identity,
+			'artwork'      => $artwork,
+			'title_map'    => $title_map,
+			'credentials'  => $credentials,
+		);
+	}
+
+	/**
+	 * Refresh the compact last-known health projection on an owner action.
+	 *
+	 * @return bool
+	 */
+	public function refresh_health_snapshot(): bool {
+		$ids = get_posts(
+			array(
+				'post_type'              => 'review',
+				'post_status'            => 'publish',
+				'posts_per_page'         => 1000,
+				'fields'                 => 'ids',
+				'no_found_rows'          => true,
+				'update_post_meta_cache' => false,
+				'update_post_term_cache' => false,
+			)
+		);
+		$ids = is_array( $ids ) ? array_slice( $ids, 0, 1000 ) : array();
+		$identity = array(
+			'total'           => 0,
+			'with_imdb_id'    => 0,
+			'missing_imdb_id' => 0,
+			'needs_review'    => 0,
+		);
+		$artwork = array(
+			'eligible' => 0,
+			'complete' => 0,
+			'missing'  => 0,
+		);
+
+		foreach ( $ids as $post_id ) {
+			$post_id = (int) $post_id;
+			$identity['total']++;
+			$imdb_id = $this->normalize_imdb_id( get_post_meta( $post_id, '_lunara_imdb_title_id', true ) );
+			$status  = trim( (string) get_post_meta( $post_id, self::META_STATUS, true ) );
+			if ( '' === $imdb_id ) {
+				$identity['missing_imdb_id']++;
+			} else {
+				$identity['with_imdb_id']++;
+				$artwork['eligible']++;
+				$has_poster   = '' !== trim( (string) get_post_meta( $post_id, self::META_POSTER, true ) );
+				$has_backdrop = '' !== trim( (string) get_post_meta( $post_id, self::META_BACKDROP, true ) );
+				if ( $has_poster && $has_backdrop ) {
+					$artwork['complete']++;
+				} else {
+					$artwork['missing']++;
+				}
+			}
+
+			if ( ! in_array( $status, array( 'verified', 'autofilled' ), true ) ) {
+				$identity['needs_review']++;
+			}
+		}
+
+		$snapshot = array(
+			'schema_version' => self::HEALTH_SNAPSHOT_SCHEMA_VERSION,
+			'identity'       => $identity,
+			'artwork'        => $artwork,
+		);
+		$sentinel = self::option_sentinel();
+		$stored   = get_option( self::OPTION_HEALTH_SNAPSHOT, $sentinel );
+		if ( $sentinel === $stored ) {
+			add_option( self::OPTION_HEALTH_SNAPSHOT, $snapshot, '', false );
+		} else {
+			update_option( self::OPTION_HEALTH_SNAPSHOT, $snapshot, false );
+		}
+
+		return get_option( self::OPTION_HEALTH_SNAPSHOT, $sentinel ) === $snapshot;
 	}
 
 	/**
@@ -142,8 +394,8 @@ final class Lunara_IMDb_Guard {
 		$year           = trim( (string) get_post_meta( $post_id, '_lunara_year', true ) );
 		$current_id     = $this->normalize_imdb_id( get_post_meta( $post_id, '_lunara_imdb_title_id', true ) );
 		$state          = $this->get_stored_state( $post_id );
-		$map_path       = $this->get_theme_map_path();
-		$map_state      = $map_path && is_writable( $map_path ) ? __( 'Writable', 'lunara-imdb-guard' ) : __( 'Read-only or missing', 'lunara-imdb-guard' );
+		$title_map      = $this->get_title_map();
+		$map_state      = is_array( $title_map ) ? __( 'Ready', 'lunara-imdb-guard' ) : __( 'Migration pending', 'lunara-imdb-guard' );
 		$lookup_context = $this->resolve_lookup_context( $post_id );
 		$lookup_source  = $this->format_lookup_source_label( $lookup_context['source'] );
 		
@@ -229,7 +481,7 @@ final class Lunara_IMDb_Guard {
 				</div>
 			<?php endif; ?>
 
-			<p style="margin-top:10px;"><strong><?php esc_html_e( 'Theme Map Sync', 'lunara-imdb-guard' ); ?></strong><br><?php echo esc_html( $map_state ); ?></p>
+			<p style="margin-top:10px;"><strong><?php esc_html_e( 'Canonical Title Map', 'lunara-imdb-guard' ); ?></strong><br><?php echo esc_html( $map_state ); ?></p>
 
 			<div class="lunara-imdb-guard-actions">
 				<a class="button" href="<?php echo esc_url( $validate_url ); ?>"><?php esc_html_e( 'Validate IMDb ID', 'lunara-imdb-guard' ); ?></a>
@@ -253,7 +505,6 @@ final class Lunara_IMDb_Guard {
 
 		$omdb_configured = '' !== $this->get_api_key();
 		$tmdb_configured = '' !== $this->get_tmdb_api_key();
-		$map_path        = $this->get_theme_map_path();
 		$reviews       = get_posts(
 			array(
 				'post_type'              => 'review',
@@ -298,13 +549,6 @@ final class Lunara_IMDb_Guard {
 						<td>
 							<input type="password" class="regular-text" id="lunara_imdb_guard_tmdb_api_key" name="lunara_imdb_guard_tmdb_api_key" value="" autocomplete="new-password" placeholder="<?php echo esc_attr( $tmdb_configured ? __( 'Saved — paste a new key to replace', 'lunara-imdb-guard' ) : __( 'Paste TMDB API key (optional)', 'lunara-imdb-guard' ) ); ?>">
 							<p class="description"><?php echo esc_html( $tmdb_configured ? __( 'Status: Configured (write-only). Leave blank to keep it. Syncs poster/backdrop artwork from TMDB.', 'lunara-imdb-guard' ) : __( 'Not configured. Leave blank to reuse the Oscars Ledger TMDB key when that plugin is active.', 'lunara-imdb-guard' ) ); ?></p>
-						</td>
-					</tr>
-					<tr>
-						<th scope="row"><?php esc_html_e( 'Theme Map File', 'lunara-imdb-guard' ); ?></th>
-						<td>
-							<code><?php echo esc_html( $map_path ? $map_path : __( 'Not found', 'lunara-imdb-guard' ) ); ?></code>
-							<p class="description"><?php esc_html_e( 'When writable, verified IDs also sync to the active theme imdb-title-map.json file.', 'lunara-imdb-guard' ); ?></p>
 						</td>
 					</tr>
 				</table>
@@ -495,7 +739,7 @@ final class Lunara_IMDb_Guard {
 		$state = $this->get_stored_state( $post_id );
 		if ( '' !== $state['expected_id'] ) {
 			update_post_meta( $post_id, '_lunara_imdb_title_id', $state['expected_id'] );
-			$this->sync_theme_map_entry(
+			$this->sync_title_map_entry(
 				get_the_title( $post_id ),
 				get_post_meta( $post_id, '_lunara_year', true ),
 				$state['expected_id']
@@ -544,6 +788,7 @@ final class Lunara_IMDb_Guard {
 			$this->validate_review( $review_id, true );
 			$count++;
 		}
+		$this->refresh_health_snapshot();
 
 		wp_safe_redirect(
 			add_query_arg(
@@ -732,6 +977,7 @@ final class Lunara_IMDb_Guard {
 				$filled_backdrops++;
 			}
 		}
+		$this->refresh_health_snapshot();
 
 		wp_safe_redirect(
 			add_query_arg(
@@ -937,7 +1183,7 @@ final class Lunara_IMDb_Guard {
 				$title,
 				$year
 			);
-			$this->sync_theme_map_entry( $title, $expected_year, $expected_id );
+			$this->sync_title_map_entry( $title, $expected_year, $expected_id );
 			
 			// Process TMDB assets matching our newly autofilled ID
 			$this->sync_lunara_tmdb_images( $post_id, $expected_id );
@@ -961,7 +1207,7 @@ final class Lunara_IMDb_Guard {
 				$title,
 				$year
 			);
-			$this->sync_theme_map_entry( $title, $expected_year, $expected_id );
+			$this->sync_title_map_entry( $title, $expected_year, $expected_id );
 			
 			// Keep images updated on active verification passes
 			$this->sync_lunara_tmdb_images( $post_id, $current_id );
@@ -1581,59 +1827,220 @@ final class Lunara_IMDb_Guard {
 	}
 
 	/**
-	 * Get the active theme's map path.
+	 * Return an object that cannot collide with a stored option value.
 	 *
-	 * @return string
+	 * @return stdClass
 	 */
-	private function get_theme_map_path() {
-		$path = trailingslashit( get_stylesheet_directory() ) . 'assets/data/imdb-title-map.json';
-		return file_exists( $path ) || is_dir( dirname( $path ) ) ? $path : '';
+	private static function option_sentinel() {
+		return new stdClass();
 	}
 
 	/**
-	 * Sync a verified title-year pair into the active theme's imdb-title-map.json.
+	 * Read and normalize the active stylesheet's bounded legacy map.
 	 *
-	 * @param string $title   Review title.
-	 * @param string $year    Review year.
-	 * @param string $imdb_id IMDb title id.
-	 * @return void
+	 * @return array|null
 	 */
-	private function sync_theme_map_entry( $title, $year, $imdb_id ) {
-		$path = $this->get_theme_map_path();
-		if ( '' === $path ) {
-			return;
+	private function read_legacy_title_map() {
+		$path = trailingslashit( get_stylesheet_directory() ) . 'assets/data/imdb-title-map.json';
+		if ( ! is_file( $path ) ) {
+			return null;
 		}
 
-		$key = $this->build_map_key( $title, $year );
-		if ( '' === $key || '' === $imdb_id ) {
-			return;
+		$size = filesize( $path );
+		if ( false !== $size && $size > self::LEGACY_MAP_MAX_BYTES ) {
+			return null;
 		}
 
-		$dir = dirname( $path );
-		if ( ! is_dir( $dir ) ) {
-			wp_mkdir_p( $dir );
+		$raw = file_get_contents( $path, false, null, 0, self::LEGACY_MAP_MAX_BYTES + 1 );
+		if ( false === $raw || strlen( $raw ) > self::LEGACY_MAP_MAX_BYTES ) {
+			return null;
 		}
 
-		if ( file_exists( $path ) && ! is_writable( $path ) ) {
-			return;
+		$trimmed = ltrim( $raw );
+		if ( '' === $trimmed || '{' !== $trimmed[0] ) {
+			return null;
 		}
 
-		if ( ! file_exists( $path ) && ! is_writable( $dir ) ) {
-			return;
+		$decoded = json_decode( $raw, true );
+		if ( JSON_ERROR_NONE !== json_last_error() || ! is_array( $decoded ) ) {
+			return null;
 		}
 
-		$data = array();
-		if ( file_exists( $path ) ) {
-			$loaded = json_decode( (string) file_get_contents( $path ), true );
-			if ( is_array( $loaded ) ) {
-				$data = $loaded;
+		return $this->normalize_title_map( $decoded );
+	}
+
+	/**
+	 * Normalize a complete title map or reject the whole candidate.
+	 *
+	 * @param mixed $candidate Candidate map.
+	 * @return array|null
+	 */
+	private function normalize_title_map( $candidate ) {
+		if ( ! is_array( $candidate ) || count( $candidate ) > self::LEGACY_MAP_MAX_ENTRIES ) {
+			return null;
+		}
+
+		if ( ! empty( $candidate ) && array_keys( $candidate ) === range( 0, count( $candidate ) - 1 ) ) {
+			return null;
+		}
+
+		$normalized = array();
+		foreach ( $candidate as $raw_key => $raw_id ) {
+			if ( ! is_string( $raw_key ) || ! is_scalar( $raw_id ) ) {
+				return null;
+			}
+
+			$separator = strrpos( $raw_key, '|' );
+			if ( false === $separator ) {
+				return null;
+			}
+			$title = substr( $raw_key, 0, $separator );
+			$year  = trim( substr( $raw_key, $separator + 1 ) );
+			$key   = $this->build_map_key( $title, $year );
+			$id    = $this->normalize_title_map_id( $raw_id );
+			if ( '' === $key || ! preg_match( '/^\d{4}$/', $year ) || '' === $id ) {
+				return null;
+			}
+
+			if ( isset( $normalized[ $key ] ) && $normalized[ $key ] !== $id ) {
+				return null;
+			}
+			$normalized[ $key ] = $id;
+		}
+
+		ksort( $normalized, SORT_NATURAL | SORT_FLAG_CASE );
+		return $normalized;
+	}
+
+	/**
+	 * Accept only a bare IMDb ID or canonical IMDb title URL in stored maps.
+	 *
+	 * @param mixed $raw_id Candidate stored value.
+	 * @return string
+	 */
+	private function normalize_title_map_id( $raw_id ) {
+		$raw_id = trim( (string) $raw_id );
+		if ( preg_match( '/^tt\d{7,10}$/i', $raw_id, $matches ) ) {
+			return strtolower( $matches[0] );
+		}
+		if ( preg_match( '~^https?://(?:www\.)?imdb\.com/title/(tt\d{7,10})/?(?:[?#].*)?$~i', $raw_id, $matches ) ) {
+			return strtolower( $matches[1] );
+		}
+
+		return '';
+	}
+
+	/**
+	 * Mark migration complete only after the canonical map is valid.
+	 *
+	 * @return bool
+	 */
+	private function mark_title_map_migration_complete() {
+		$map = $this->get_title_map();
+		if ( ! is_array( $map ) ) {
+			return false;
+		}
+
+		$sentinel = self::option_sentinel();
+		$marker   = get_option( self::OPTION_TITLE_MAP_MIGRATION, $sentinel );
+		if ( self::TITLE_MAP_SCHEMA_VERSION !== $marker ) {
+			if ( $sentinel === $marker ) {
+				add_option( self::OPTION_TITLE_MAP_MIGRATION, self::TITLE_MAP_SCHEMA_VERSION, '', false );
+			} else {
+				update_option( self::OPTION_TITLE_MAP_MIGRATION, self::TITLE_MAP_SCHEMA_VERSION, false );
 			}
 		}
 
-		$data[ $key ] = $imdb_id;
-		ksort( $data, SORT_NATURAL | SORT_FLAG_CASE );
+		return self::TITLE_MAP_SCHEMA_VERSION === get_option( self::OPTION_TITLE_MAP_MIGRATION, $sentinel );
+	}
 
-		file_put_contents( $path, wp_json_encode( $data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES ) . PHP_EOL );
+	/**
+	 * Update an existing canonical map without seeding partial pre-migration data.
+	 *
+	 * @param mixed $title   Review title.
+	 * @param mixed $year    Review year.
+	 * @param mixed $imdb_id IMDb title ID.
+	 * @return bool
+	 */
+	private function sync_title_map_entry( $title, $year, $imdb_id ) {
+		if ( ! is_scalar( $title ) || ! is_scalar( $year ) || ! is_scalar( $imdb_id ) ) {
+			return false;
+		}
+		$key     = $this->build_map_key( (string) $title, (string) $year );
+		$imdb_id = $this->normalize_imdb_id( $imdb_id );
+		if ( '' === $key || '' === $imdb_id ) {
+			return false;
+		}
+
+		$map = $this->get_title_map();
+		if ( ! is_array( $map ) ) {
+			return false;
+		}
+
+		$lock_token = microtime( true ) . ':' . mt_rand();
+		if ( ! add_option( self::OPTION_TITLE_MAP_LOCK, $lock_token, '', false ) ) {
+			$current = $this->get_title_map();
+			return is_array( $current ) && isset( $current[ $key ] ) && $imdb_id === $current[ $key ];
+		}
+
+		try {
+			$current = $this->get_title_map();
+			if ( ! is_array( $current ) ) {
+				return false;
+			}
+
+			$current[ $key ] = $imdb_id;
+			ksort( $current, SORT_NATURAL | SORT_FLAG_CASE );
+			update_option( self::OPTION_TITLE_MAP, $current, false );
+
+			return $current === $this->get_title_map();
+		} finally {
+			if ( $lock_token === get_option( self::OPTION_TITLE_MAP_LOCK, self::option_sentinel() ) ) {
+				delete_option( self::OPTION_TITLE_MAP_LOCK );
+			}
+		}
+	}
+
+	/**
+	 * Read and strictly allowlist a compact health snapshot.
+	 *
+	 * @return array|null
+	 */
+	private function read_health_snapshot() {
+		$sentinel = self::option_sentinel();
+		$stored   = get_option( self::OPTION_HEALTH_SNAPSHOT, $sentinel );
+		if ( $sentinel === $stored || ! is_array( $stored ) || self::HEALTH_SNAPSHOT_SCHEMA_VERSION !== ( $stored['schema_version'] ?? null ) ) {
+			return null;
+		}
+
+		$identity_keys = array( 'total', 'with_imdb_id', 'missing_imdb_id', 'needs_review' );
+		$artwork_keys  = array( 'eligible', 'complete', 'missing' );
+		$identity      = array();
+		$artwork       = array();
+		foreach ( $identity_keys as $key ) {
+			if ( ! isset( $stored['identity'][ $key ] ) || ! is_int( $stored['identity'][ $key ] ) || $stored['identity'][ $key ] < 0 || $stored['identity'][ $key ] > 1000 ) {
+				return null;
+			}
+			$identity[ $key ] = $stored['identity'][ $key ];
+		}
+		foreach ( $artwork_keys as $key ) {
+			if ( ! isset( $stored['artwork'][ $key ] ) || ! is_int( $stored['artwork'][ $key ] ) || $stored['artwork'][ $key ] < 0 || $stored['artwork'][ $key ] > 1000 ) {
+				return null;
+			}
+			$artwork[ $key ] = $stored['artwork'][ $key ];
+		}
+
+		if ( $identity['total'] !== $identity['with_imdb_id'] + $identity['missing_imdb_id']
+			|| $identity['needs_review'] > $identity['total']
+			|| $artwork['eligible'] !== $identity['with_imdb_id']
+			|| $artwork['eligible'] !== $artwork['complete'] + $artwork['missing'] ) {
+			return null;
+		}
+
+		return array(
+			'identity' => $identity,
+			'artwork'  => $artwork,
+		);
 	}
 
 	/**
@@ -1647,7 +2054,7 @@ final class Lunara_IMDb_Guard {
 		$title = $this->normalize_title_key( $title );
 		$year  = trim( (string) $year );
 
-		if ( '' === $title || '' === $year ) {
+		if ( '' === $title || ! preg_match( '/^\d{4}$/', $year ) ) {
 			return '';
 		}
 
@@ -1683,4 +2090,62 @@ final class Lunara_IMDb_Guard {
 	}
 }
 
+register_activation_hook( LUNARA_IMDB_GUARD_FILE, array( 'Lunara_IMDb_Guard', 'activate' ) );
 Lunara_IMDb_Guard::instance();
+
+if ( ! function_exists( 'lunara_imdb_guard_get_title_map' ) ) {
+	/**
+	 * Return the canonical sanitized title map or NULL while unavailable.
+	 *
+	 * @return array|null
+	 */
+	function lunara_imdb_guard_get_title_map(): ?array {
+		return Lunara_IMDb_Guard::instance()->get_title_map();
+	}
+}
+
+if ( ! function_exists( 'lunara_imdb_guard_lookup_title_id' ) ) {
+	/**
+	 * Resolve an IMDb title ID from the canonical map.
+	 *
+	 * @param mixed $title Film title.
+	 * @param mixed $year  Four-digit release year.
+	 * @return string
+	 */
+	function lunara_imdb_guard_lookup_title_id( $title, $year = '' ): string {
+		return Lunara_IMDb_Guard::instance()->lookup_title_id( $title, $year );
+	}
+}
+
+if ( ! function_exists( 'lunara_imdb_guard_admin_url' ) ) {
+	/**
+	 * Return the canonical IMDb Guard admin URL.
+	 *
+	 * @return string
+	 */
+	function lunara_imdb_guard_admin_url(): string {
+		return Lunara_IMDb_Guard::instance()->admin_url();
+	}
+}
+
+if ( ! function_exists( 'lunara_imdb_guard_admin_capability' ) ) {
+	/**
+	 * Return the canonical IMDb Guard capability.
+	 *
+	 * @return string
+	 */
+	function lunara_imdb_guard_admin_capability(): string {
+		return Lunara_IMDb_Guard::instance()->admin_capability();
+	}
+}
+
+if ( ! function_exists( 'lunara_imdb_guard_health_status' ) ) {
+	/**
+	 * Return bounded, redacted identity and artwork health.
+	 *
+	 * @return array
+	 */
+	function lunara_imdb_guard_health_status(): array {
+		return Lunara_IMDb_Guard::instance()->health_status();
+	}
+}

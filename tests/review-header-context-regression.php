@@ -23,6 +23,9 @@ function trailingslashit( string $path ): string {
 function add_action(): void {
 }
 
+function register_activation_hook(): void {
+}
+
 function get_post_field( string $field, int $post_id ) {
 	if ( 'post_content' !== $field ) {
 		return '';

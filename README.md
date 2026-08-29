@@ -14,7 +14,7 @@ This plugin validates Review IMDb IDs against title/year data, helps fill clear 
 
 ## Version
 
-Current baseline: `0.4.1`.
+Current baseline: `0.4.2`.
 
 ## Secrets
 

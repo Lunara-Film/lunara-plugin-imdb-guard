@@ -25,6 +25,9 @@ jobs:
       - name: Review header regression
         run: php tests/review-header-context-regression.php
 
+      - name: Site Studio persistence contracts
+        run: php tests/site-studio-persistence-contract.php
+
       - name: JS syntax
         run: |
           set -e
