@@ -32,6 +32,9 @@ final class Lunara_IMDb_Guard {
 	const HEALTH_SNAPSHOT_SCHEMA_VERSION = 1;
 	const LEGACY_MAP_MAX_BYTES      = 1048576;
 	const LEGACY_MAP_MAX_ENTRIES    = 5000;
+	const TITLE_MAP_LOCK_TTL        = 5;
+	const TITLE_MAP_LOCK_ATTEMPTS   = 5;
+	const TITLE_MAP_LOCK_RETRY_US   = 10000;
 	const META_STATUS    = '_lunara_imdb_guard_status';
 	const META_MESSAGE   = '_lunara_imdb_guard_message';
 	const META_EXPECTED  = '_lunara_imdb_guard_expected_id';
@@ -739,11 +742,6 @@ final class Lunara_IMDb_Guard {
 		$state = $this->get_stored_state( $post_id );
 		if ( '' !== $state['expected_id'] ) {
 			update_post_meta( $post_id, '_lunara_imdb_title_id', $state['expected_id'] );
-			$this->sync_title_map_entry(
-				get_the_title( $post_id ),
-				get_post_meta( $post_id, '_lunara_year', true ),
-				$state['expected_id']
-			);
 			
 			// Dynamic asset lookup following manual alignment application
 			$this->sync_lunara_tmdb_images( $post_id, $state['expected_id'] );
@@ -1183,7 +1181,12 @@ final class Lunara_IMDb_Guard {
 				$title,
 				$year
 			);
-			$this->sync_title_map_entry( $title, $expected_year, $expected_id );
+			if ( ! $this->sync_title_map_entry( $title, $expected_year, $expected_id ) ) {
+				$result['status']  = 'error';
+				$result['message'] = __( 'IMDb validation succeeded, but canonical title-map sync is temporarily unavailable. Retry validation.', 'lunara-imdb-guard' );
+				$this->store_state( $post_id, $result );
+				return $result;
+			}
 			
 			// Process TMDB assets matching our newly autofilled ID
 			$this->sync_lunara_tmdb_images( $post_id, $expected_id );
@@ -1207,7 +1210,12 @@ final class Lunara_IMDb_Guard {
 				$title,
 				$year
 			);
-			$this->sync_title_map_entry( $title, $expected_year, $expected_id );
+			if ( ! $this->sync_title_map_entry( $title, $expected_year, $expected_id ) ) {
+				$result['status']  = 'error';
+				$result['message'] = __( 'IMDb validation succeeded, but canonical title-map sync is temporarily unavailable. Retry validation.', 'lunara-imdb-guard' );
+				$this->store_state( $post_id, $result );
+				return $result;
+			}
 			
 			// Keep images updated on active verification passes
 			$this->sync_lunara_tmdb_images( $post_id, $current_id );
@@ -2005,8 +2013,8 @@ final class Lunara_IMDb_Guard {
 			return false;
 		}
 
-		$lock_token = microtime( true ) . ':' . mt_rand();
-		if ( ! add_option( self::OPTION_TITLE_MAP_LOCK, $lock_token, '', false ) ) {
+		$lock = $this->acquire_title_map_lock();
+		if ( ! is_array( $lock ) ) {
 			$current = $this->get_title_map();
 			return is_array( $current ) && isset( $current[ $key ] ) && $imdb_id === $current[ $key ];
 		}
@@ -2023,10 +2031,112 @@ final class Lunara_IMDb_Guard {
 
 			return $current === $this->get_title_map();
 		} finally {
-			if ( $lock_token === get_option( self::OPTION_TITLE_MAP_LOCK, self::option_sentinel() ) ) {
-				delete_option( self::OPTION_TITLE_MAP_LOCK );
+			$this->release_title_map_lock( $lock );
+		}
+	}
+
+	/**
+	 * Acquire the canonical-map mutation lock with bounded live-owner retries.
+	 *
+	 * @return array|null
+	 */
+	private function acquire_title_map_lock() {
+		for ( $attempt = 0; $attempt < self::TITLE_MAP_LOCK_ATTEMPTS; $attempt++ ) {
+			$now  = time();
+			$lock = array(
+				'token'       => md5( uniqid( 'lunara-title-map-lock-', true ) . mt_rand() ),
+				'acquired_at' => $now,
+				'expires_at'  => $now + self::TITLE_MAP_LOCK_TTL,
+			);
+			if ( add_option( self::OPTION_TITLE_MAP_LOCK, $lock, '', false ) ) {
+				return $lock;
+			}
+
+			$sentinel = self::option_sentinel();
+			$observed = get_option( self::OPTION_TITLE_MAP_LOCK, $sentinel );
+			$valid    = $this->normalize_title_map_lock( $observed );
+			if ( is_array( $valid ) && $observed === $valid && $valid['expires_at'] <= $now ) {
+				$this->compare_and_delete_title_map_lock( $valid );
+				continue;
+			}
+
+			if ( $attempt + 1 < self::TITLE_MAP_LOCK_ATTEMPTS ) {
+				usleep( self::TITLE_MAP_LOCK_RETRY_US );
 			}
 		}
+
+		return null;
+	}
+
+	/**
+	 * Validate a strict time-bounded lock record.
+	 *
+	 * @param mixed $lock Candidate lock value.
+	 * @return array|null
+	 */
+	private function normalize_title_map_lock( $lock ) {
+		if ( ! is_array( $lock ) || 3 !== count( $lock ) ) {
+			return null;
+		}
+		$keys = array_keys( $lock );
+		sort( $keys, SORT_STRING );
+		if ( array( 'acquired_at', 'expires_at', 'token' ) !== $keys
+			|| ! is_string( $lock['token'] )
+			|| ! preg_match( '/^[a-f0-9]{32}$/', $lock['token'] )
+			|| ! is_int( $lock['acquired_at'] )
+			|| ! is_int( $lock['expires_at'] )
+			|| $lock['acquired_at'] <= 0
+			|| $lock['expires_at'] <= $lock['acquired_at']
+			|| $lock['expires_at'] - $lock['acquired_at'] > 60 ) {
+			return null;
+		}
+
+		return array(
+			'token'       => $lock['token'],
+			'acquired_at' => $lock['acquired_at'],
+			'expires_at'  => $lock['expires_at'],
+		);
+	}
+
+	/**
+	 * Release only the exact lock record still owned by this writer.
+	 *
+	 * @param array $lock Expected owner record.
+	 * @return bool
+	 */
+	private function release_title_map_lock( $lock ) {
+		$lock = $this->normalize_title_map_lock( $lock );
+		return is_array( $lock ) && $this->compare_and_delete_title_map_lock( $lock );
+	}
+
+	/**
+	 * Conditionally delete an unchanged lock row and invalidate its option cache.
+	 *
+	 * @param array $expected Exact observed lock record.
+	 * @return bool
+	 */
+	private function compare_and_delete_title_map_lock( $expected ) {
+		global $wpdb;
+
+		$expected = $this->normalize_title_map_lock( $expected );
+		if ( ! is_array( $expected ) || ! isset( $wpdb->options ) || ! is_callable( array( $wpdb, 'delete' ) ) ) {
+			return false;
+		}
+
+		$deleted = $wpdb->delete(
+			$wpdb->options,
+			array(
+				'option_name'  => self::OPTION_TITLE_MAP_LOCK,
+				'option_value' => maybe_serialize( $expected ),
+			),
+			array( '%s', '%s' )
+		);
+		wp_cache_delete( self::OPTION_TITLE_MAP_LOCK, 'options' );
+		if ( 1 !== (int) $deleted ) {
+			return false;
+		}
+
+		return true;
 	}
 
 	/**
