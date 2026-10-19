@@ -164,4 +164,25 @@ assert_same(
 	'validation reaches OMDb configuration after using the header year'
 );
 
+// Review headlines carry a take line after a spaced dash, and WordPress
+// stores the dash as an HTML entity. OMDb must receive the film title only.
+$headline_cases = array(
+	'en dash entity'          => array( 'Misty Green &#8211; The Price of Second Acts', 'Misty Green' ),
+	'en dash character'       => array( 'Practical Magic 2 – The Curdled Spell', 'Practical Magic 2' ),
+	'em dash entity'          => array( 'Lurker &#8212; The Title Is the Position', 'Lurker' ),
+	'spaced hyphen'           => array( 'The Social Reckoning - A Procedural Without a Pulse', 'The Social Reckoning' ),
+	'unspaced hyphen kept'    => array( 'Spider-Man: Brand New Day', 'Spider-Man: Brand New Day' ),
+	'take line and year'      => array( 'Heat (1995) &#8211; The Long Goodbye', 'Heat' ),
+	'apostrophe entity'       => array( 'Mary Shelley&#8217;s Frankenstein', 'Mary Shelley’s Frankenstein' ),
+);
+
+$headline_post = 500;
+foreach ( $headline_cases as $label => $case ) {
+	$GLOBALS['lunara_test_content'][ $headline_post ] = '<p>Body with no header comment.</p>';
+	$GLOBALS['lunara_test_titles'][ $headline_post ]  = $case[0];
+	$context = invoke_private( $guard, 'resolve_lookup_context', array( $headline_post ) );
+	assert_same( $case[1], $context['title'], $label . ' resolves to the film title' );
+	$headline_post++;
+}
+
 fwrite( STDOUT, "Review header context regression passed.\n" );

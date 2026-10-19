@@ -3,7 +3,7 @@
  * Plugin Name: Lunara IMDb Guard
  * Plugin URI: https://lunarafilm.com/
  * Description: Validates review IMDb IDs against title and year, auto-fills clear matches, syncs TMDB poster/backdrop artwork, and provides an editorial audit screen for Lunara.
- * Version: 0.4.1
+ * Version: 0.4.2
  * Author: Lunara Film
  * Author URI: https://lunarafilm.com/
  * License: GPL v2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'LUNARA_IMDB_GUARD_VERSION', '0.4.1' );
+define( 'LUNARA_IMDB_GUARD_VERSION', '0.4.2' );
 define( 'LUNARA_IMDB_GUARD_FILE', __FILE__ );
 define( 'LUNARA_IMDB_GUARD_DIR', plugin_dir_path( __FILE__ ) );
 define( 'LUNARA_IMDB_GUARD_DEFAULT_OMDB_API_KEY', '' );
@@ -1274,8 +1274,9 @@ final class Lunara_IMDb_Guard {
 			);
 		}
 
-		$post_title = trim( wp_strip_all_tags( get_the_title( $post_id ) ) );
-		$stripped   = preg_replace( '/\s*\((?:19|20)\d{2}\)\s*$/', '', $post_title );
+		$post_title = $this->clean_lookup_title( get_the_title( $post_id ) );
+		$stripped   = $this->strip_editorial_subtitle( $post_title );
+		$stripped   = preg_replace( '/\s*\((?:19|20)\d{2}\)\s*$/', '', $stripped );
 		$stripped   = $this->clean_lookup_title( $stripped );
 
 		return array(
@@ -1321,9 +1322,27 @@ final class Lunara_IMDb_Guard {
 	 */
 	private function clean_lookup_title( $title ) {
 		$title = trim( wp_strip_all_tags( (string) $title ) );
-		$title = preg_replace( '/\s+/', ' ', $title );
+		$title = html_entity_decode( $title, ENT_QUOTES | ENT_HTML5, 'UTF-8' );
+		$title = preg_replace( '/\s+/u', ' ', $title );
 
 		return trim( (string) $title, " \t\n\r\0\x0B\"'“”" );
+	}
+
+	/**
+	 * Remove the editorial take line from a review headline.
+	 *
+	 * Review titles read "Film – The Take" (en dash, em dash or a spaced hyphen).
+	 * OMDb only knows "Film", so everything from the first spaced dash is dropped.
+	 * A dash with no space on both sides ("Spider-Man") is part of the film title.
+	 *
+	 * @param string $title Clean review headline.
+	 * @return string
+	 */
+	private function strip_editorial_subtitle( $title ) {
+		$parts = preg_split( '/\s+[–—-]{1,2}\s+/u', (string) $title, 2 );
+		$film  = trim( (string) ( $parts[0] ?? '' ) );
+
+		return '' !== $film ? $film : (string) $title;
 	}
 
 	/**
