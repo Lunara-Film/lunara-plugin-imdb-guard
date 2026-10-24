@@ -19,7 +19,7 @@ jobs:
     outputs:
       tested: ${{ steps.reuse.outputs.tested }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Reuse the pull request result for an identical tree
         id: reuse
@@ -32,7 +32,7 @@ jobs:
     if: ${{ !cancelled() && needs.reuse.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: CI reuse policy
         run: node --test .github/scripts/ci-reuse.test.cjs
@@ -82,7 +82,7 @@ jobs:
 
       - name: Record the fully tested tree
         if: github.event_name == 'pull_request'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ci-passed-tree-${{ env.TESTED_TREE }}
           path: ${{ runner.temp }}/tested-tree.txt
