@@ -159,7 +159,7 @@ assert_same(
 	'validation uses the Review header year in its OMDb lookup key'
 );
 assert_same(
-	'No OMDb API key is configured for Lunara IMDb Guard.',
+	'No OMDb API key is configured for Lunara Film IMDb Guard.',
 	$validation['message'],
 	'validation reaches OMDb configuration after using the header year'
 );
