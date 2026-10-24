@@ -119,7 +119,7 @@ function Invoke-Tmdb([string]$url) {
 
 # ------------------------------------------------------------------- run --
 Write-Host ''
-Write-Host ("Lunara poster preflight - mode: {0}, source: {1}" -f $Mode, $Source)
+Write-Host ("Lunara Film poster preflight - mode: {0}, source: {1}" -f $Mode, $Source)
 Write-Host ("Input : {0}" -f $InputFile)
 if ($Mode -eq 'download') { Write-Host ("Output: {0}" -f $OutputDir) }
 Write-Host ''

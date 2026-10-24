@@ -1,4 +1,4 @@
-# Lunara IMDb Guard
+# Lunara Film IMDb Guard
 
 Private WordPress plugin source for Lunara Film IMDb validation and editorial audit tooling.
 
@@ -14,7 +14,8 @@ This plugin validates Review IMDb IDs against title/year data, helps fill clear 
 
 ## Version
 
-Current baseline: `0.4.2`.
+The version lives in one file: the plugin header and
+`LUNARA_IMDB_GUARD_VERSION` in `lunara-imdb-guard.php`.
 
 ## Secrets
 

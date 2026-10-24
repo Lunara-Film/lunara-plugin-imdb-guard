@@ -1,9 +1,9 @@
 <?php
 /**
- * Plugin Name: Lunara IMDb Guard
+ * Plugin Name: Lunara Film IMDb Guard
  * Plugin URI: https://lunarafilm.com/
- * Description: Validates review IMDb IDs against title and year, auto-fills clear matches, syncs TMDB poster/backdrop artwork, and provides an editorial audit screen for Lunara.
- * Version: 0.4.2
+ * Description: Validates review IMDb IDs against title and year, auto-fills clear matches, syncs TMDB poster/backdrop artwork, and provides an editorial audit screen for Lunara Film.
+ * Version: 0.4.3
  * Author: Lunara Film
  * Author URI: https://lunarafilm.com/
  * License: GPL v2 or later
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'LUNARA_IMDB_GUARD_VERSION', '0.4.2' );
+define( 'LUNARA_IMDB_GUARD_VERSION', '0.4.3' );
 define( 'LUNARA_IMDB_GUARD_FILE', __FILE__ );
 define( 'LUNARA_IMDB_GUARD_DIR', plugin_dir_path( __FILE__ ) );
 define( 'LUNARA_IMDB_GUARD_DEFAULT_OMDB_API_KEY', '' );
@@ -80,7 +80,7 @@ final class Lunara_IMDb_Guard {
 	public function register_meta_box() {
 		add_meta_box(
 			'lunara_imdb_guard',
-			__( 'Lunara IMDb Guard', 'lunara-imdb-guard' ),
+			__( 'Lunara Film IMDb Guard', 'lunara-imdb-guard' ),
 			array( $this, 'render_meta_box' ),
 			'review',
 			'side',
@@ -279,7 +279,7 @@ final class Lunara_IMDb_Guard {
 		);
 		?>
 		<div class="wrap">
-			<h1><?php esc_html_e( 'Lunara IMDb Guard', 'lunara-imdb-guard' ); ?></h1>
+			<h1><?php esc_html_e( 'Lunara Film IMDb Guard', 'lunara-imdb-guard' ); ?></h1>
 			<p><?php esc_html_e( 'This plugin validates review title/year data against OMDb, auto-fills clear missing IMDb IDs, syncs high-resolution assets from TMDB, and keeps an editorial audit trail inside WordPress.', 'lunara-imdb-guard' ); ?></p>
 
 			<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="margin:18px 0 28px;">
@@ -646,7 +646,7 @@ final class Lunara_IMDb_Guard {
 		header( 'Content-Type: text/plain; charset=utf-8' );
 		header( 'Content-Disposition: attachment; filename="titles-' . $source . '-' . $scope . '-' . gmdate( 'Ymd' ) . '.txt"' );
 
-		echo '# Lunara poster manifest — source: ' . $source . ', scope: ' . $scope . ', ' . count( $lines ) . " films\n"; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		echo '# Lunara Film poster manifest — source: ' . $source . ', scope: ' . $scope . ', ' . count( $lines ) . " films\n"; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo '# Feed to tools/local/local-poster-preflight.ps1 (save as titles.txt beside it).' . "\n"; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		echo implode( "\n", $lines ) . "\n"; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		exit;
@@ -1003,7 +1003,7 @@ final class Lunara_IMDb_Guard {
 		if ( '' === $api_key ) {
 			return array(
 				'status'  => 'error',
-				'message' => __( 'No OMDb API key is configured for Lunara IMDb Guard.', 'lunara-imdb-guard' ),
+				'message' => __( 'No OMDb API key is configured for Lunara Film IMDb Guard.', 'lunara-imdb-guard' ),
 			);
 		}
 
